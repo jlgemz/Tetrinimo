@@ -1,12 +1,36 @@
 import React, { useCallback, useEffect, useState, useRef } from 'react';
 import { eventBus, EVENTS } from '../game/eventBus';
 import { Game, GameState } from '../game/game';
+import { gameUIChanged, pickGameUI, type GameUIState } from '../game/gameUi';
 import { Renderer } from '../game/renderer';
+import { ensureCsrf, pingApi } from '../api/client';
 import { auth, User } from '../game/auth';
 import { leaderboard, LeaderboardEntry } from '../game/leaderboard';
+
+type ApiStatus = 'checking' | 'online' | 'offline';
 import type { Theme } from '../game/procedural';
 // === Cartoony palette ===
 const NEONS = ['#ff6ec7', '#22d3ee', '#a3e635', '#fde047', '#ff9f1c', '#c084fc'];
+
+const BACKGROUND_SPARKLES = Array.from({ length: 15 }, (_, i) => ({
+  id: i,
+  left: `${(i * 17 + 7) % 100}%`,
+  top: `${(i * 23 + 11) % 100}%`,
+  fontSize: 8 + (i % 5) * 2,
+  delay: `${(i % 6) * 0.5}s`
+}));
+
+const FLOATING_DECOR = [
+  { top: '8%', left: '3%', color: '#ff6ec7', shape: 'L', size: 50, delay: '0s', rot: -15 },
+  { top: '22%', left: '88%', color: '#22d3ee', shape: 'T', size: 58, delay: '0.5s', rot: 20 },
+  { top: '52%', left: '2%', color: '#a3e635', shape: 'S', size: 52, delay: '1s', rot: 10 },
+  { top: '68%', left: '93%', color: '#fde047', shape: 'L', size: 46, delay: '1.5s', rot: -20 },
+  { top: '85%', left: '6%', color: '#ff9f1c', shape: 'I', size: 50, delay: '2s', rot: 35 },
+  { top: '38%', left: '95%', color: '#c084fc', shape: 'O', size: 42, delay: '0.8s', rot: 0 },
+  { top: '90%', left: '85%', color: '#ff6ec7', shape: 'T', size: 48, delay: '1.2s', rot: -10 },
+  { top: '5%', left: '55%', color: '#a3e635', shape: 'I', size: 44, delay: '1.8s', rot: 25 },
+  { top: '95%', left: '45%', color: '#22d3ee', shape: 'S', size: 46, delay: '2.5s', rot: 45 }
+] as const;
 // Simple Web Audio beep — playful cartoon "boop"
 function playBeep(freq = 600, duration = 120, type: OscillatorType = 'square') {
   try {
@@ -259,7 +283,9 @@ export function Tetris() {
   const prevScoreRef = useRef(0);
   const toastIdRef = useRef(0);
   const scoreIdRef = useRef(0);
-  const [gameState, setGameState] = useState<GameState | null>(null);
+  const [gameUI, setGameUI] = useState<GameUIState | null>(null);
+  const lastUIRef = useRef<GameUIState | null>(null);
+  const renderRafRef = useRef<number | null>(null);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [showAuthModal, setShowAuthModal] = useState(true);
@@ -269,6 +295,8 @@ export function Tetris() {
     password: ''
   });
   const [authError, setAuthError] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [apiStatus, setApiStatus] = useState<ApiStatus>('checking');
   const [showPassword, setShowPassword] = useState(false);
   const [topScores, setTopScores] = useState<LeaderboardEntry[]>([]);
   const [userRank, setUserRank] = useState<number | null>(null);
@@ -308,25 +336,54 @@ export function Tetris() {
     },
     []
   );
-  const updateLeaderboard = useCallback((username?: string) => {
-    setTopScores(leaderboard.getTopScores());
-    if (username) setUserRank(leaderboard.getUserRank(username));
-  }, []);
-  useEffect(() => {
-    const user = auth.getCurrentUser();
-    if (user) {
-      setCurrentUser(user);
-      setShowAuthModal(false);
-      updateLeaderboard(user.username);
+  const updateLeaderboard = useCallback(async (username?: string) => {
+    const scores = await leaderboard.getTopScores();
+    setTopScores(scores);
+    if (username) {
+      setUserRank(await leaderboard.getUserRank(username));
     } else {
-      updateLeaderboard();
+      setUserRank(null);
     }
-  }, [updateLeaderboard]);
-  // Tick every 500ms to update shield cooldown countdown
-  useEffect(() => {
-    const id = setInterval(() => setNow(performance.now()), 500);
-    return () => clearInterval(id);
   }, []);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const online = await pingApi();
+      if (cancelled) return;
+      setApiStatus(online ? 'online' : 'offline');
+      if (!online) return;
+
+      try {
+        await ensureCsrf();
+      } catch {
+        // API is up; login may still fail until CSRF is fixed — keep online
+      }
+
+      const userResult = await auth.fetchCurrentUser();
+      if (cancelled) return;
+      const user = userResult;
+      if (user) {
+        setCurrentUser(user);
+        setShowAuthModal(false);
+      }
+      const scores = await leaderboard.getTopScores();
+      if (cancelled) return;
+      setTopScores(scores);
+      if (user) {
+        setUserRank(await leaderboard.getUserRank(user.username));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // Shield cooldown countdown — only while recharging
+  useEffect(() => {
+    const end = gameUI?.shieldCooldownEnd;
+    if (!end || gameUI?.shieldAvailable || end <= Date.now()) return;
+    const id = setInterval(() => setNow(performance.now()), 1000);
+    return () => clearInterval(id);
+  }, [gameUI?.shieldCooldownEnd, gameUI?.shieldAvailable]);
   useEffect(() => {
     if (!canvasRef.current || !nextCanvasRef.current || !holdCanvasRef.current)
     return;
@@ -336,8 +393,15 @@ export function Tetris() {
       nextCanvasRef.current,
       holdCanvasRef.current
     );
+    const syncGameUI = (state: GameState) => {
+      const ui = pickGameUI(state);
+      if (gameUIChanged(lastUIRef.current, ui)) {
+        lastUIRef.current = ui;
+        setGameUI(ui);
+      }
+    };
+
     const handleStateUpdate = (state: GameState) => {
-      // Floating score numbers on score increase
       if (state.score > prevScoreRef.current) {
         const delta = state.score - prevScoreRef.current;
         if (delta >= 40) {
@@ -356,23 +420,36 @@ export function Tetris() {
         }
       }
       prevScoreRef.current = state.score;
-      setGameState(state);
-      rendererRef.current?.render(state);
+      syncGameUI(state);
     };
+
+    const renderLoop = () => {
+      const game = gameRef.current;
+      const renderer = rendererRef.current;
+      if (game && renderer && !showAuthModal) {
+        const state = game.getState();
+        if (!state.isPaused) {
+          renderer.render(state);
+        }
+      }
+      renderRafRef.current = requestAnimationFrame(renderLoop);
+    };
+    renderRafRef.current = requestAnimationFrame(renderLoop);
     const handleThemeChange = (t: Theme) => {
       setTheme(t);
       rendererRef.current?.setTheme(t);
       // No popup — theme is shown in the left panel card
       playBeep(800, 100, 'sine');
     };
-    const handleGameOver = (payload: {score: number;lines: number;}) => {
+    const handleGameOver = async (payload: {score: number;lines: number;}) => {
       playBeep(180, 400, 'sawtooth');
       const user = auth.getCurrentUser();
       if (user) {
-        const prevTop = leaderboard.getTopScores(1)[0];
-        leaderboard.saveScore(user.username, payload.score, payload.lines);
-        auth.updateUserStats(payload.score);
-        updateLeaderboard(user.username);
+        const prevTop = (await leaderboard.getTopScores(1))[0];
+        await leaderboard.saveScore(user.username, payload.score, payload.lines);
+        const refreshed = await auth.refreshUser();
+        if (refreshed) setCurrentUser(refreshed);
+        await updateLeaderboard(user.username);
         const wasHighScore = !prevTop || payload.score > prevTop.score;
         if (wasHighScore && payload.score > 0) {
           setIsHighScore(true);
@@ -521,6 +598,10 @@ export function Tetris() {
       showCanvasEffect('LEVEL 1', '🎮', '#fde047', "Let's go!", 1800);
     }
     return () => {
+      if (renderRafRef.current !== null) {
+        cancelAnimationFrame(renderRafRef.current);
+        renderRafRef.current = null;
+      }
       window.removeEventListener('keydown', handleKeyDown);
       eventBus.clear();
       gameRef.current?.stop();
@@ -540,38 +621,45 @@ export function Tetris() {
       setTimeout(() => setCanvasEffect(null), 1800);
     }
   };
-  const handleAuth = (e: React.FormEvent) => {
+  const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
     if (!authForm.username || !authForm.password) {
       setAuthError('Please fill all fields!');
       return;
     }
-    const res =
-    authMode === 'login' ?
-    auth.login(authForm.username, authForm.password) :
-    auth.signup(authForm.username, authForm.password);
-    if (res.success && res.user) {
-      setCurrentUser(res.user);
-      setShowAuthModal(false);
-      updateLeaderboard(res.user.username);
-      eventBus.emit(EVENTS.USER_LOGIN, res.user);
-      playBeep(800, 150, 'sine');
-    } else {
-      setAuthError(res.error || 'Authentication failed!');
-      playBeep(200, 200, 'sawtooth');
+    setAuthSubmitting(true);
+    try {
+      const res =
+      authMode === 'login' ?
+      await auth.login(authForm.username, authForm.password) :
+      await auth.signup(authForm.username, authForm.password);
+      if (res.success && res.user) {
+        setCurrentUser(res.user);
+        setShowAuthModal(false);
+        setApiStatus('online');
+        await updateLeaderboard(res.user.username);
+        eventBus.emit(EVENTS.USER_LOGIN, res.user);
+        playBeep(800, 150, 'sine');
+      } else {
+        setAuthError(res.error || 'Authentication failed!');
+        playBeep(200, 200, 'sawtooth');
+      }
+    } finally {
+      setAuthSubmitting(false);
     }
   };
   const handleGuest = () => {
     setShowAuthModal(false);
     pushToast('Wobble on, Guest!', '🎮', '#fde047');
   };
-  const handleLogout = () => {
-    auth.logout();
+  const handleLogout = async () => {
+    await auth.logout();
     eventBus.emit(EVENTS.USER_LOGOUT);
     setCurrentUser(null);
     setShowAuthModal(true);
     gameRef.current?.stop();
+    await updateLeaderboard();
   };
   const rankEmoji = (rank: number) => {
     if (rank === 0) return '🥇';
@@ -610,17 +698,15 @@ export function Tetris() {
       
       {/* Subtle background sparkles */}
       <div className="absolute inset-0 pointer-events-none opacity-30">
-        {Array.from({
-          length: 30
-        }).map((_, i) =>
+        {BACKGROUND_SPARKLES.map((s) =>
         <span
-          key={i}
+          key={s.id}
           className="absolute text-white animate-sparkle"
           style={{
-            left: `${Math.random() * 100}%`,
-            top: `${Math.random() * 100}%`,
-            fontSize: `${8 + Math.random() * 12}px`,
-            animationDelay: `${Math.random() * 3}s`
+            left: s.left,
+            top: s.top,
+            fontSize: `${s.fontSize}px`,
+            animationDelay: s.delay
           }}>
           
             ✦
@@ -630,89 +716,7 @@ export function Tetris() {
 
       {/* Floating decorative tetrominoes — matches logo vibe, fills empty space */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden hidden md:block">
-        {[
-        {
-          top: '8%',
-          left: '3%',
-          color: '#ff6ec7',
-          shape: 'L',
-          size: 50,
-          delay: '0s',
-          rot: -15
-        },
-        {
-          top: '22%',
-          left: '88%',
-          color: '#22d3ee',
-          shape: 'T',
-          size: 58,
-          delay: '0.5s',
-          rot: 20
-        },
-        {
-          top: '52%',
-          left: '2%',
-          color: '#a3e635',
-          shape: 'S',
-          size: 52,
-          delay: '1s',
-          rot: 10
-        },
-        {
-          top: '68%',
-          left: '93%',
-          color: '#fde047',
-          shape: 'L',
-          size: 46,
-          delay: '1.5s',
-          rot: -20
-        },
-        {
-          top: '85%',
-          left: '6%',
-          color: '#ff9f1c',
-          shape: 'I',
-          size: 50,
-          delay: '2s',
-          rot: 35
-        },
-        {
-          top: '38%',
-          left: '95%',
-          color: '#c084fc',
-          shape: 'O',
-          size: 42,
-          delay: '0.8s',
-          rot: 0
-        },
-        {
-          top: '90%',
-          left: '85%',
-          color: '#ff6ec7',
-          shape: 'T',
-          size: 48,
-          delay: '1.2s',
-          rot: -10
-        },
-        {
-          top: '5%',
-          left: '55%',
-          color: '#a3e635',
-          shape: 'I',
-          size: 44,
-          delay: '1.8s',
-          rot: 25
-        },
-        {
-          top: '95%',
-          left: '45%',
-          color: '#22d3ee',
-          shape: 'S',
-          size: 46,
-          delay: '2.5s',
-          rot: 45
-        }].
-        map((b, i) =>
+        {FLOATING_DECOR.map((b, i) =>
         <FloatingTetromino
           key={i}
           top={b.top}
@@ -722,7 +726,6 @@ export function Tetris() {
           size={b.size}
           delay={b.delay}
           rotation={b.rot} />
-
         )}
       </div>
 
@@ -732,7 +735,7 @@ export function Tetris() {
       <div className="relative z-10 px-2 md:px-4 py-2 flex justify-between items-center gap-2 md:gap-4 flex-shrink-0">
         <TetrinimoTitle small={false} />
         {currentUser ?
-        <div className="flex items-center gap-2 bg-white/10 backdrop-blur-md px-3 py-1.5 rounded-full border-2 border-white/30">
+        <div className="flex items-center gap-2 bg-white/10 backdrop-blur-sm px-3 py-1.5 rounded-full border-2 border-white/30">
             <span className="text-lg">{currentUser.avatar || '🎮'}</span>
             <span className="font-display text-white text-sm">
               {currentUser.username}
@@ -768,7 +771,7 @@ export function Tetris() {
         {/* Left Panel — sidebar on md+, compact top strip on mobile */}
         <div className="flex flex-row md:flex-col gap-2 w-full md:w-40 flex-shrink-0 md:overflow-y-auto custom-scrollbar overflow-x-auto md:overflow-x-visible flex-wrap md:flex-nowrap">
           {/* Hold piece */}
-          <div className="bg-white/15 backdrop-blur-md p-2 rounded-2xl border-2 border-white/40 shadow-md">
+          <div className="bg-white/15 backdrop-blur-sm p-2 rounded-2xl border-2 border-white/40 shadow-md">
             <div className="font-display text-center text-white text-xs mb-1">
               💼 HOLD
             </div>
@@ -787,7 +790,7 @@ export function Tetris() {
           </div>
 
           {/* Next piece */}
-          <div className="bg-white/15 backdrop-blur-md p-2 rounded-2xl border-2 border-white/40 shadow-md">
+          <div className="bg-white/15 backdrop-blur-sm p-2 rounded-2xl border-2 border-white/40 shadow-md">
             <div className="font-display text-center text-white text-xs mb-1">
               🎁 NEXT
             </div>
@@ -807,13 +810,13 @@ export function Tetris() {
 
           {/* Shield */}
           {(() => {
-            const cooldown = gameState?.shieldCooldownEnd ?
+            const cooldown = gameUI?.shieldCooldownEnd ?
             Math.max(
               0,
-              Math.ceil((gameState.shieldCooldownEnd - now) / 1000)
+              Math.ceil((gameUI.shieldCooldownEnd - now) / 1000)
             ) :
             0;
-            const ready = gameState?.shieldAvailable;
+            const ready = gameUI?.shieldAvailable;
             const total = 120;
             const pct = cooldown > 0 ? (total - cooldown) / total * 100 : 100;
             return (
@@ -844,7 +847,7 @@ export function Tetris() {
           })()}
 
           {/* Theme */}
-          <div className="bg-white/15 backdrop-blur-md p-2 rounded-2xl border-2 border-white/30 text-center">
+          <div className="bg-white/15 backdrop-blur-sm p-2 rounded-2xl border-2 border-white/30 text-center">
             <div className="text-xl">{theme?.emoji || '🌌'}</div>
             <div
               className="font-display text-xs"
@@ -891,19 +894,19 @@ export function Tetris() {
             <div className="flex-1 bg-pink-500/30 backdrop-blur px-2 py-1 rounded-lg border-2 border-pink-300/60 text-center">
               <div className="text-[10px] font-hand text-pink-100">Score</div>
               <div className="font-display text-sm text-white tabular-nums">
-                {gameState?.score.toLocaleString() || 0}
+                {gameUI?.score.toLocaleString() || 0}
               </div>
             </div>
             <div className="flex-1 bg-cyan-500/30 backdrop-blur px-2 py-1 rounded-lg border-2 border-cyan-300/60 text-center">
               <div className="text-[10px] font-hand text-cyan-100">Lines</div>
               <div className="font-display text-sm text-white">
-                {gameState?.linesCleared || 0}
+                {gameUI?.linesCleared || 0}
               </div>
             </div>
             <div className="flex-1 bg-yellow-400/30 backdrop-blur px-2 py-1 rounded-lg border-2 border-yellow-300/60 text-center">
               <div className="text-[10px] font-hand text-yellow-100">Lvl</div>
               <div className="font-display text-sm text-white">
-                {gameState?.level || 1}
+                {gameUI?.level || 1}
               </div>
             </div>
             <button
@@ -1014,8 +1017,8 @@ export function Tetris() {
             </div>
 
             {/* Game Over modal */}
-            {gameState?.gameOver &&
-            <div className="absolute inset-0 bg-indigo-950/95 backdrop-blur-md flex flex-col items-center justify-center rounded-2xl z-30 animate-bounce-in p-6">
+            {gameUI?.gameOver &&
+            <div className="absolute inset-0 bg-indigo-950/95 backdrop-blur-sm flex flex-col items-center justify-center rounded-2xl z-30 animate-bounce-in p-6">
                 {isHighScore &&
               <div className="font-display text-2xl text-yellow-300 mb-2 animate-wobble">
                     🏆 NEW HIGH SCORE! 🏆
@@ -1032,10 +1035,10 @@ export function Tetris() {
                     color: theme?.accent || '#c084fc'
                   }}>
                   
-                    {gameState.score.toLocaleString()}
+                    {gameUI.score.toLocaleString()}
                   </p>
                   <p className="font-hand text-cyan-200 text-sm mt-2">
-                    {gameState.linesCleared} lines cleared
+                    {gameUI.linesCleared} lines cleared
                   </p>
                   {currentUser ?
                 <p className="text-xs text-green-300 mt-2 font-hand">
@@ -1153,25 +1156,25 @@ export function Tetris() {
             <div className="bg-pink-500/30 backdrop-blur p-2 rounded-xl border-2 border-pink-300/60 text-center">
               <div className="text-xs font-hand text-pink-100">🏆 Score</div>
               <div className="font-display text-lg text-white tabular-nums">
-                {gameState?.score.toLocaleString() || 0}
+                {gameUI?.score.toLocaleString() || 0}
               </div>
             </div>
             <div className="bg-cyan-500/30 backdrop-blur p-2 rounded-xl border-2 border-cyan-300/60 text-center">
               <div className="text-xs font-hand text-cyan-100">📊 Lines</div>
               <div className="font-display text-lg text-white">
-                {gameState?.linesCleared || 0}
+                {gameUI?.linesCleared || 0}
               </div>
             </div>
             <div className="bg-yellow-400/30 backdrop-blur p-2 rounded-xl border-2 border-yellow-300/60 text-center">
               <div className="text-xs font-hand text-yellow-100">⚡ Lvl</div>
               <div className="font-display text-lg text-white">
-                {gameState?.level || 1}
+                {gameUI?.level || 1}
               </div>
             </div>
           </div>
 
           {/* Leaderboard */}
-          <div className="bg-white/15 backdrop-blur-md rounded-2xl border-2 border-white/40 overflow-hidden shadow-md flex-1 min-h-0 flex flex-col">
+          <div className="bg-white/15 backdrop-blur-sm rounded-2xl border-2 border-white/40 overflow-hidden shadow-md flex-1 min-h-0 flex flex-col">
             <div className="p-2 border-b-2 border-white/30 bg-yellow-400/20 flex items-center gap-2 flex-shrink-0">
               <span className="text-lg">🏆</span>
               <span className="font-display text-white text-sm">
@@ -1245,11 +1248,11 @@ export function Tetris() {
       {/* Mobile Leaderboard Modal */}
       {showLeaderboardModal &&
       <div
-        className="fixed inset-0 bg-indigo-950/90 backdrop-blur-xl z-50 flex items-center justify-center p-4 md:hidden animate-bounce-in"
+        className="fixed inset-0 bg-indigo-950/90 backdrop-blur-md z-50 flex items-center justify-center p-4 md:hidden animate-bounce-in"
         onClick={() => setShowLeaderboardModal(false)}>
         
           <div
-          className="bg-white/15 backdrop-blur-md rounded-3xl border-4 border-white/40 max-w-md w-full max-h-[80vh] flex flex-col overflow-hidden"
+          className="bg-white/15 backdrop-blur-sm rounded-3xl border-4 border-white/40 max-w-md w-full max-h-[80vh] flex flex-col overflow-hidden"
           onClick={(e) => e.stopPropagation()}>
           
             <div className="p-3 border-b-2 border-white/30 bg-yellow-400/20 flex items-center justify-between">
@@ -1314,7 +1317,7 @@ export function Tetris() {
 
       {/* Auth Modal — Gatekeeper Gloop */}
       {showAuthModal &&
-      <div className="fixed inset-0 bg-indigo-950/90 backdrop-blur-xl z-50 flex items-center justify-center p-4 animate-bounce-in overflow-y-auto">
+      <div className="fixed inset-0 bg-indigo-950/90 backdrop-blur-md z-50 flex items-center justify-center p-4 animate-bounce-in overflow-y-auto">
           <div className="max-w-md w-full">
             <div className="flex justify-center mb-6">
               <Gatekeeper
@@ -1327,6 +1330,18 @@ export function Tetris() {
               <div className="text-center mb-4">
                 <TetrinimoTitle small />
               </div>
+
+              {apiStatus === 'offline' &&
+            <p className="text-amber-800 text-sm text-center font-hand bg-amber-100 rounded-xl py-2 px-3 mb-4 border-2 border-amber-300">
+                  Backend offline — start Django on port 8000, or play as
+                  guest.
+                </p>
+            }
+              {apiStatus === 'checking' &&
+            <p className="text-indigo-600/70 text-xs text-center font-hand mb-3">
+                  Connecting to server…
+                </p>
+            }
 
               <div className="flex bg-indigo-100 rounded-full p-1 mb-5">
                 <button
@@ -1399,9 +1414,12 @@ export function Tetris() {
 
                 <button
                 type="submit"
-                className={`btn-bubbly w-full py-3 text-white text-lg ${authMode === 'login' ? 'bg-pink-500' : 'bg-lime-500'}`}>
+                disabled={authSubmitting}
+                className={`btn-bubbly w-full py-3 text-white text-lg disabled:opacity-60 disabled:cursor-wait ${authMode === 'login' ? 'bg-pink-500' : 'bg-lime-500'}`}>
                 
-                  {authMode === 'login' ?
+                  {authSubmitting ?
+              'Please wait…' :
+              authMode === 'login' ?
                 '🎮 ENTER THE GRID' :
                 '🚀 JOIN THE FUN'}
                 </button>

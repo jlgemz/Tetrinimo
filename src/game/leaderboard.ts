@@ -1,3 +1,6 @@
+import { apiFetch } from '../api/client';
+import { auth } from './auth';
+
 export interface LeaderboardEntry {
   username: string;
   score: number;
@@ -5,37 +8,41 @@ export interface LeaderboardEntry {
   timestamp: number;
 }
 
-const LEADERBOARD_KEY = 'tetris_leaderboard';
-
 export const leaderboard = {
-  getScores(): LeaderboardEntry[] {
-    const data = localStorage.getItem(LEADERBOARD_KEY);
-    return data ? JSON.parse(data) : [];
+  async getTopScores(limit = 10): Promise<LeaderboardEntry[]> {
+    try {
+      const res = await apiFetch(`/scores/?limit=${limit}`);
+      if (!res.ok) return [];
+      return res.json();
+    } catch {
+      return [];
+    }
   },
 
-  saveScore(username: string, score: number, lines: number) {
-    const scores = this.getScores();
-    scores.push({
-      username,
-      score,
-      lines,
-      timestamp: Date.now()
-    });
-
-    // Sort descending by score
-    scores.sort((a, b) => b.score - a.score);
-
-    localStorage.setItem(LEADERBOARD_KEY, JSON.stringify(scores));
+  async saveScore(_username: string, score: number, lines: number): Promise<void> {
+    try {
+      const res = await apiFetch('/scores/', {
+        method: 'POST',
+        body: JSON.stringify({ score, lines })
+      });
+      if (res.ok) {
+        await auth.refreshUser();
+      }
+    } catch {
+      // score not saved if backend unavailable
+    }
   },
 
-  getTopScores(limit: number = 10): LeaderboardEntry[] {
-    return this.getScores().slice(0, limit);
-  },
-
-  getUserRank(username: string): number | null {
-    const scores = this.getScores();
-    // Find highest score for this user
-    const userBestIndex = scores.findIndex((s) => s.username === username);
-    return userBestIndex !== -1 ? userBestIndex + 1 : null;
+  async getUserRank(username: string): Promise<number | null> {
+    try {
+      const res = await apiFetch(
+        `/scores/rank/?username=${encodeURIComponent(username)}`
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.rank ?? null;
+    } catch {
+      return null;
+    }
   }
 };

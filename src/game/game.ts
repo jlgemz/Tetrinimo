@@ -103,6 +103,10 @@ export class Game {
     }
   }
 
+  getState(): GameState {
+    return this.state;
+  }
+
   private loop = (time: number) => {
     if (this.state.gameOver || this.state.isPaused) return;
 
