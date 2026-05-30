@@ -125,4 +125,13 @@ CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:5173',
     'http://127.0.0.1:5173',
+    'http://localhost:4173',
+    'http://127.0.0.1:4173',
 ]
+
+if DEBUG:
+    for _port in (5173, 4173, 3000):
+        for _host in ('localhost', '127.0.0.1'):
+            _origin = f'http://{_host}:{_port}'
+            if _origin not in CSRF_TRUSTED_ORIGINS:
+                CSRF_TRUSTED_ORIGINS.append(_origin)

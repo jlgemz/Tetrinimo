@@ -179,7 +179,7 @@ export async function parseError(res: Response, fallback: string): Promise<strin
 export async function pingApi(timeoutMs = 3000): Promise<boolean> {
   try {
     const res = await fetchWithTimeout(
-      `${API_BASE}/scores/?limit=1`,
+      `${API_BASE}/health/`,
       { credentials: 'include' },
       timeoutMs
     );

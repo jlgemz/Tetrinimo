@@ -5,8 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:win": "powershell -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "dev:win": "powershell -ExecutionPolicy Bypass -File scripts/dev-all.ps1",
+    "dev:all": "powershell -ExecutionPolicy Bypass -File scripts/dev-all.ps1",
+    "dev:api": "powershell -ExecutionPolicy Bypass -File scripts/dev-api.ps1",
+    "setup:backend": "powershell -ExecutionPolicy Bypass -File scripts/setup-backend.ps1",
+    "test:api": "powershell -ExecutionPolicy Bypass -File scripts/test-api.ps1",
     "dev:free": "powershell -ExecutionPolicy Bypass -File scripts/free-port.ps1",
+    "dev:free:api": "powershell -ExecutionPolicy Bypass -File scripts/free-port.ps1 -Port 8000",
     "build": "vite build",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "preview": "vite preview"

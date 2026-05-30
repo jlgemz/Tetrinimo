@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState, useRef } from 'react';
 import { eventBus, EVENTS } from '../game/eventBus';
-import { Game, GameState } from '../game/game';
+import { Game, GameState, SHIELD_COOLDOWN_SEC } from '../game/game';
 import { gameUIChanged, pickGameUI, type GameUIState } from '../game/gameUi';
 import { Renderer } from '../game/renderer';
 import { ensureCsrf, pingApi } from '../api/client';
@@ -310,7 +310,7 @@ export function Tetris() {
     color: string;
     sub: string;
   } | null>(null);
-  const [now, setNow] = useState(performance.now());
+  const [shieldTick, setShieldTick] = useState(0);
   const [showConfetti, setShowConfetti] = useState(false);
   const [isHighScore, setIsHighScore] = useState(false);
   const [showLeaderboardModal, setShowLeaderboardModal] = useState(false);
@@ -345,45 +345,58 @@ export function Tetris() {
       setUserRank(null);
     }
   }, []);
+  const syncBackendState = useCallback(async () => {
+    const online = await pingApi();
+    setApiStatus(online ? 'online' : 'offline');
+    if (!online) return false;
+
+    try {
+      await ensureCsrf();
+    } catch {
+      // API is up; auth endpoints are CSRF-exempt on the server
+    }
+
+    const user = await auth.fetchCurrentUser();
+    if (user) {
+      setCurrentUser(user);
+      setShowAuthModal(false);
+    }
+    await updateLeaderboard(user?.username);
+    return true;
+  }, [updateLeaderboard]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const online = await pingApi();
+      await syncBackendState();
       if (cancelled) return;
-      setApiStatus(online ? 'online' : 'offline');
-      if (!online) return;
-
-      try {
-        await ensureCsrf();
-      } catch {
-        // API is up; login may still fail until CSRF is fixed — keep online
-      }
-
-      const userResult = await auth.fetchCurrentUser();
-      if (cancelled) return;
-      const user = userResult;
-      if (user) {
-        setCurrentUser(user);
-        setShowAuthModal(false);
-      }
-      const scores = await leaderboard.getTopScores();
-      if (cancelled) return;
-      setTopScores(scores);
-      if (user) {
-        setUserRank(await leaderboard.getUserRank(user.username));
-      }
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
-  // Shield cooldown countdown — only while recharging
+  }, [syncBackendState]);
+
+  useEffect(() => {
+    if (apiStatus !== 'offline') return;
+    const id = setInterval(() => {
+      void syncBackendState();
+    }, 5000);
+    return () => clearInterval(id);
+  }, [apiStatus, syncBackendState]);
+  // Shield cooldown countdown — tick UI while recharging
   useEffect(() => {
     const end = gameUI?.shieldCooldownEnd;
-    if (!end || gameUI?.shieldAvailable || end <= Date.now()) return;
-    const id = setInterval(() => setNow(performance.now()), 1000);
+    if (!end || gameUI?.shieldAvailable || gameUI?.shieldActive) return;
+
+    const tick = () => setShieldTick((n) => n + 1);
+    tick();
+    const id = setInterval(tick, 250);
     return () => clearInterval(id);
-  }, [gameUI?.shieldCooldownEnd, gameUI?.shieldAvailable]);
+  }, [
+    gameUI?.shieldCooldownEnd,
+    gameUI?.shieldAvailable,
+    gameUI?.shieldActive
+  ]);
   useEffect(() => {
     if (!canvasRef.current || !nextCanvasRef.current || !holdCanvasRef.current)
     return;
@@ -520,7 +533,9 @@ export function Tetris() {
       playBeep(150, 300, 'square');
     };
     const handleLevelUp = (level: number) => {
-      showCanvasEffect(`LEVEL ${level}`, '⭐', '#fde047', 'Faster falls ahead!');
+      const sub =
+        level >= 5 ? 'Speed boost — hang on!' : 'Faster falls ahead!';
+      showCanvasEffect(`LEVEL ${level}`, '⭐', '#fde047', sub);
       playBeep(1100, 200, 'triangle');
       setTimeout(() => playBeep(1400, 200, 'triangle'), 150);
     };
@@ -810,18 +825,20 @@ export function Tetris() {
 
           {/* Shield */}
           {(() => {
-            const cooldown = gameUI?.shieldCooldownEnd ?
-            Math.max(
-              0,
-              Math.ceil((gameUI.shieldCooldownEnd - now) / 1000)
-            ) :
-            0;
+            void shieldTick;
+            const end = gameUI?.shieldCooldownEnd;
+            const active = gameUI?.shieldActive;
             const ready = gameUI?.shieldAvailable;
-            const total = 120;
-            const pct = cooldown > 0 ? (total - cooldown) / total * 100 : 100;
+            const cooldown =
+              end && !ready && !active ?
+                Math.max(0, Math.ceil((end - Date.now()) / 1000))
+              : 0;
+            const total = SHIELD_COOLDOWN_SEC;
+            const pct =
+              cooldown > 0 ? ((total - cooldown) / total) * 100 : 100;
             return (
               <div
-                className={`p-2 rounded-2xl border-2 transition-all duration-300 ${ready ? 'bg-yellow-400/30 border-yellow-300 text-yellow-100 animate-pulse-border' : 'bg-white/10 border-white/30 text-white/70'}`}>
+                className={`p-2 rounded-2xl border-2 transition-all duration-300 ${ready ? 'bg-yellow-400/30 border-yellow-300 text-yellow-100 animate-pulse-border' : active ? 'bg-yellow-500/40 border-yellow-200 text-yellow-50' : 'bg-white/10 border-white/30 text-white/70'}`}>
                 
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1 font-display text-sm">
@@ -829,10 +846,14 @@ export function Tetris() {
                     <span>Shield (S)</span>
                   </div>
                   <span className="font-display text-sm">
-                    {ready ? '✅ READY' : `${cooldown}s`}
+                    {ready ?
+                    '✅ READY' :
+                    active ?
+                    '⚡ ACTIVE' :
+                    `${cooldown}s`}
                   </span>
                 </div>
-                {!ready &&
+                {!ready && !active &&
                 <div className="mt-1 h-1.5 bg-black/30 rounded-full overflow-hidden">
                     <div
                     className="h-full bg-yellow-400 transition-all duration-500"
@@ -1333,8 +1354,15 @@ export function Tetris() {
 
               {apiStatus === 'offline' &&
             <p className="text-amber-800 text-sm text-center font-hand bg-amber-100 rounded-xl py-2 px-3 mb-4 border-2 border-amber-300">
-                  Backend offline — start Django on port 8000, or play as
-                  guest.
+                  Backend offline — run{' '}
+                  <code className="text-xs bg-amber-200/80 px-1 rounded">
+                    npm run dev:all
+                  </code>{' '}
+                  or{' '}
+                  <code className="text-xs bg-amber-200/80 px-1 rounded">
+                    npm run dev:api
+                  </code>
+                  , then refresh. Or play as guest.
                 </p>
             }
               {apiStatus === 'checking' &&

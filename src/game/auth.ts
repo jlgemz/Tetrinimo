@@ -1,4 +1,4 @@
-import { apiFetch, isApiError, parseError } from '../api/client';
+import { apiFetch, ensureCsrf, isApiError, parseError } from '../api/client';
 
 export interface User {
   id: string;
@@ -58,6 +58,7 @@ export const auth = {
 
   async signup(username: string, password: string): Promise<AuthResult> {
     try {
+      await ensureCsrf();
       const res = await apiFetch('/auth/register/', {
         method: 'POST',
         body: JSON.stringify({ username, password })
@@ -81,6 +82,7 @@ export const auth = {
 
   async login(username: string, password: string): Promise<AuthResult> {
     try {
+      await ensureCsrf();
       const res = await apiFetch('/auth/login/', {
         method: 'POST',
         body: JSON.stringify({ username, password })

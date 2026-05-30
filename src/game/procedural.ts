@@ -102,9 +102,17 @@ export class ProceduralGenerator {
     return THEMES[themeIndex];
   }
 
-  getFallSpeed(linesCleared: number): number {
-    const level = Math.floor(linesCleared / 10) + 1;
-    return Math.max(100, 1000 * Math.pow(0.9, level - 1));
+  /**
+   * Milliseconds between automatic drops. Uses game level (not line count).
+   * Levels 1–4 ease in gently; level 5+ ramps up noticeably.
+   */
+  getFallSpeed(level: number): number {
+    const lv = Math.max(1, level);
+    if (lv <= 4) {
+      return 1000 - (lv - 1) * 50;
+    }
+    const level5Speed = 700;
+    return Math.max(90, Math.round(level5Speed * Math.pow(0.9, lv - 5)));
   }
 
   getLevel(linesCleared: number): number {

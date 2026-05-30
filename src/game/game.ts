@@ -24,14 +24,15 @@ export interface GameState {
   // New Mechanics
   shieldAvailable: boolean;
   shieldActive: boolean;
-  shieldCooldownEnd: number | null; // timestamp when shield becomes available again
+  shieldCooldownEnd: number | null; // Date.now() ms when shield becomes available again
   heldPieceType: TetrominoType | null;
   canSwap: boolean;
   lastGravityShift: number;
   corruptionThreshold: number;
 }
 
-export const SHIELD_COOLDOWN_MS = 120000; // 2 minutes
+export const SHIELD_COOLDOWN_MS = 90_000; // 1 minute 30 seconds
+export const SHIELD_COOLDOWN_SEC = SHIELD_COOLDOWN_MS / 1000;
 
 export class Game {
   private state: GameState;
@@ -107,36 +108,41 @@ export class Game {
     return this.state;
   }
 
-  private loop = (time: number) => {
-    if (this.state.gameOver || this.state.isPaused) return;
-
-    const deltaTime = time - this.lastTime;
-    this.lastTime = time;
-    this.dropCounter += deltaTime;
-
-    if (time - this.state.lastGravityShift > this.gravityInterval) {
-      this.applyGravityShift();
-      this.state.lastGravityShift = time;
-      this.gravityInterval = this.generator.getGravityInterval();
-    }
-
-    // Shield cooldown recharge
+  private tryRechargeShield() {
     if (
-    !this.state.shieldAvailable &&
-    !this.state.shieldActive &&
-    this.state.shieldCooldownEnd !== null &&
-    time >= this.state.shieldCooldownEnd)
-    {
+      this.state.shieldAvailable ||
+      this.state.shieldActive ||
+      this.state.shieldCooldownEnd === null
+    ) {
+      return;
+    }
+    if (Date.now() >= this.state.shieldCooldownEnd) {
       this.state.shieldAvailable = true;
       this.state.shieldCooldownEnd = null;
       this.emitState();
     }
+  }
 
-    const dropSpeed = this.generator.getFallSpeed(this.state.linesCleared);
+  private loop = (time: number) => {
+    this.tryRechargeShield();
 
-    if (this.dropCounter > dropSpeed) {
-      this.move(0, 1);
-      this.dropCounter = 0;
+    if (!this.state.gameOver && !this.state.isPaused) {
+      const deltaTime = time - this.lastTime;
+      this.lastTime = time;
+      this.dropCounter += deltaTime;
+
+      if (time - this.state.lastGravityShift > this.gravityInterval) {
+        this.applyGravityShift();
+        this.state.lastGravityShift = time;
+        this.gravityInterval = this.generator.getGravityInterval();
+      }
+
+      const dropSpeed = this.generator.getFallSpeed(this.state.level);
+
+      if (this.dropCounter > dropSpeed) {
+        this.move(0, 1);
+        this.dropCounter = 0;
+      }
     }
 
     this.animationFrameId = requestAnimationFrame(this.loop);
@@ -160,7 +166,6 @@ export class Game {
 
     this.state.nextPieceType = this.generator.getNextPiece();
     this.state.canSwap = true;
-    this.state.shieldActive = false;
 
     if (
     this.checkCollision(
@@ -206,22 +211,58 @@ export class Game {
     }
 
     this.state.canSwap = false;
-    this.state.shieldActive = false;
+    if (this.state.shieldActive) {
+      this.beginShieldCooldown();
+    }
     this.emitState();
   }
 
   private activateShield() {
     if (
-    this.state.shieldAvailable &&
-    !this.state.gameOver &&
-    this.state.currentPiece)
-    {
+      this.state.shieldAvailable &&
+      !this.state.shieldActive &&
+      !this.state.gameOver &&
+      this.state.currentPiece
+    ) {
       this.state.shieldAvailable = false;
       this.state.shieldActive = true;
-      this.state.shieldCooldownEnd = performance.now() + SHIELD_COOLDOWN_MS;
       eventBus.emit(EVENTS.SHIELD_USED);
       this.emitState();
     }
+  }
+
+  /** Starts the 90s recharge after the shield is spent on the current piece. */
+  private beginShieldCooldown() {
+    if (!this.state.shieldActive) return;
+    this.state.shieldActive = false;
+    this.state.shieldCooldownEnd = Date.now() + SHIELD_COOLDOWN_MS;
+    this.emitState();
+  }
+
+  private clearCorruptionNear(boardY: number, boardX: number): boolean {
+    const offsets: [number, number][] = [
+      [0, 0],
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1]
+    ];
+    let cleared = false;
+    for (const [dr, dc] of offsets) {
+      const ny = boardY + dr;
+      const nx = boardX + dc;
+      if (
+        ny >= 0 &&
+        ny < ROWS &&
+        nx >= 0 &&
+        nx < COLS &&
+        this.state.grid[ny][nx] === CORRUPTION_COLOR
+      ) {
+        this.state.grid[ny][nx] = null;
+        cleared = true;
+      }
+    }
+    return cleared;
   }
 
   private applyGravityShift() {
@@ -331,6 +372,7 @@ export class Game {
     if (!this.state.currentPiece) return;
 
     const { shape, color, x, y } = this.state.currentPiece;
+    const hadShield = this.state.shieldActive;
     let absorbedCorruption = false;
 
     for (let r = 0; r < shape.length; r++) {
@@ -345,23 +387,24 @@ export class Game {
             return;
           }
 
-          // Shield logic: if landing on corruption, absorb it
-          if (
-          this.state.shieldActive &&
-          y + r + 1 < ROWS &&
-          this.state.grid[y + r + 1][x + c] === CORRUPTION_COLOR)
-          {
-            this.state.grid[y + r + 1][x + c] = null; // Destroy corruption
+          const boardY = y + r;
+          const boardX = x + c;
+
+          if (hadShield && this.clearCorruptionNear(boardY, boardX)) {
             absorbedCorruption = true;
           }
 
-          this.state.grid[y + r][x + c] = color;
+          this.state.grid[boardY][boardX] = color;
         }
       }
     }
 
     if (absorbedCorruption) {
       eventBus.emit(EVENTS.SHIELD_ABSORBED);
+    }
+
+    if (hadShield) {
+      this.beginShieldCooldown();
     }
 
     eventBus.emit(EVENTS.PIECE_LOCKED);

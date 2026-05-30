@@ -45,18 +45,24 @@ Then visit [http://127.0.0.1:8000/admin/](http://127.0.0.1:8000/admin/).
 
 ## Run both
 
-1. Start Django: `cd backend && python manage.py runserver`
-2. Start Vite: `npm run dev` (from repo root)
+**Recommended (Windows):**
+
+```powershell
+npm run dev:all
+```
+
+This creates `.venv`, runs migrations, opens Django in a second window, and starts Vite. Open **http://localhost:5173/** when the terminal shows `ready`.
+
+**Manual (two terminals):**
+
+1. `npm run dev:api` — Django on port 8000
+2. `npm run dev` — Vite on port 5173
 
 Register or log in from the game modal. Guest play works without an account; scores are saved only when logged in.
 
-Wait until the terminal shows `Local: http://localhost:5173/` before opening the game in your browser. Keep that terminal open while you play.
-
 ### Windows shortcut
 
-```powershell
-npm run dev:win
-```
+`npm run dev:win` is the same as `npm run dev:all`.
 
 ## Troubleshooting
 
@@ -73,7 +79,11 @@ npm run dev:win
 
 | Command | Description |
 |---------|-------------|
+| `npm run dev:all` | Backend + frontend (Windows; recommended) |
+| `npm run dev:api` | Django API only (auto setup venv + migrate) |
+| `npm run setup:backend` | Create `.venv`, install deps, migrate DB |
 | `npm run dev` | Vite dev server on http://127.0.0.1:5173 |
-| `npm run dev:win` | Same as `dev`, with startup reminders (Windows) |
+| `npm run dev:win` | Same as `dev:all` |
+| `npm run dev:free:api` | Free port 8000 if Django is stuck |
 | `npm run build` | Production build |
 | `npm run lint` | ESLint |
