@@ -43,6 +43,20 @@ python manage.py createsuperuser
 
 Then visit [http://127.0.0.1:8000/admin/](http://127.0.0.1:8000/admin/).
 
+## Database
+
+Accounts, profiles, and leaderboard scores are stored in **SQLite** at `backend/db.sqlite3`.
+
+| Stored in SQLite | Not stored in SQLite |
+|------------------|----------------------|
+| User accounts | Live Tetris board / pieces |
+| Profiles (avatar, stats) | Guest session (no account) |
+| Leaderboard scores | |
+
+Setup: `npm run setup:backend` (creates venv and runs migrations).  
+Details: [backend/README.md](backend/README.md) (reset, admin, inspect).  
+Verify: `npm run test:api` with Django running on port 8000.
+
 ## Run both
 
 **Recommended (Windows):**
@@ -82,6 +96,7 @@ Register or log in from the game modal. Guest play works without an account; sco
 | `npm run dev:all` | Backend + frontend (Windows; recommended) |
 | `npm run dev:api` | Django API only (auto setup venv + migrate) |
 | `npm run setup:backend` | Create `.venv`, install deps, migrate DB |
+| `npm run test:api` | Smoke test API + SQLite persistence |
 | `npm run dev` | Vite dev server on http://127.0.0.1:5173 |
 | `npm run dev:win` | Same as `dev:all` |
 | `npm run dev:free:api` | Free port 8000 if Django is stuck |
